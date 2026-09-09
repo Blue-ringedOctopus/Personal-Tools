@@ -1,24 +1,44 @@
-import re
 import os
+import re
 import shutil
-from datetime import datetime
-from openpyxl import load_workbook
 import bisect
 from collections import defaultdict
+from datetime import datetime
+from openpyxl import load_workbook
 
+# ================== 配置路径（请按需修改） ==================
+EXCEL_PATH = r"xx"
+SOURCE_ROOT = r"xx"              # 源病历根目录
+TARGET_ROOT = r"xx"  # 目标根目录
+DEBUG = True  # 是否输出调试信息
+
+# ================== 1. 读取 Excel ==================
 def read_excel_dates(excel_path):
-    """从Excel的B、C列读取姓名和日期，返回列表[(姓名, 日期字符串YYYY-MM-DD), ...]"""
+    """
+    读取 B 列姓名、C 列日期，返回列表 [(姓名, YYYY-MM-DD), ...]
+    自动去除姓名首尾空格，日期统一转换为 YYYY-MM-DD 字符串。
+    """
+    records = []
     wb = load_workbook(excel_path, data_only=True)
     ws = wb.active
-    records = []
+
     for row in ws.iter_rows(min_row=2, max_col=3, values_only=True):
-        name = row[1]   # B列
-        date_val = row[2]  # C列
+        name = row[1]   # B 列
+        date_val = row[2]  # C 列
         if not name or not date_val:
             continue
+
+        # 姓名清洗
+        name = str(name).strip()
+        if not name:
+            continue
+
+        # 日期解析
         if isinstance(date_val, datetime):
             date_str = date_val.strftime("%Y-%m-%d")
         else:
+            # 尝试多种常见格式
+            date_str = None
             for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d"):
                 try:
                     dt = datetime.strptime(str(date_val), fmt)
@@ -26,113 +46,115 @@ def read_excel_dates(excel_path):
                     break
                 except ValueError:
                     continue
-            else:
+            if date_str is None:
                 print(f"警告：无法解析日期 {date_val}，跳过")
                 continue
-        records.append((str(name).strip(), date_str))
+
+        records.append((name, date_str))
+
     return records
 
-def build_source_index(source_root):
+# ================== 2. 文件系统扫描构建索引 ==================
+def build_index_from_filesystem(source_root, debug=False):
     """
-    遍历源根目录，建立患者到所有就诊日期路径的映射。
-    递归查找所有含'Aurum'的文件夹，将其下包含日期子目录的文件夹视为患者目录。
-    返回: {患者名: [(日期字符串, 完整路径), ...]}
+    通过扫描文件系统构建就诊索引。
+    返回: dict { patient_name: [(date_str, full_folder_path), ...] }
+    其中 date_str 为 'YYYY-MM-DD' 格式，full_folder_path 为日期文件夹的绝对路径。
     """
-    index = {}
-    # 遍历第一层日期文件夹
-    for date_folder in os.listdir(source_root):
-        date_path = os.path.join(source_root, date_folder)
-        if not os.path.isdir(date_path):
-            continue
-        # 查找包含'Aurum'的子文件夹
-        for sub in os.listdir(date_path):
-            sub_path = os.path.join(date_path, sub)
-            if not os.path.isdir(sub_path):
-                continue
-            if 'Aurum' not in sub:
-                continue
-            # 递归遍历 sub_path 下所有目录
-            for root, dirs, files in os.walk(sub_path):
-                # 检查当前目录下是否有符合 YYYY-MM-DD 格式的子目录
-                for d in dirs:
-                    if re.match(r'\d{4}-\d{2}-\d{2}', d):
-                        patient_dir = root      # 患者文件夹路径
-                        patient_name = os.path.basename(patient_dir)
-                        date_dir_path = os.path.join(patient_dir, d)
-                        if patient_name not in index:
-                            index[patient_name] = []
-                        index[patient_name].append((d, date_dir_path))
-                # 注意：os.walk 会继续深入，但进入日期子目录后，它的子目录没有日期格式，所以不会重复添加
+    index = defaultdict(list)
+    date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')  # 匹配 YYYY-MM-DD
 
-    # 对每个患者的日期列表排序
+    # 遍历源根目录
+    for root, dirs, files in os.walk(source_root):
+        # 检查当前目录名是否为日期格式
+        dir_name = os.path.basename(root)
+        if date_pattern.match(dir_name):
+            # 父目录名（应为患者姓名）
+            parent_name = os.path.basename(os.path.dirname(root))
+            # 排除父目录也为日期格式的情况（避免误匹配）
+            if parent_name and not date_pattern.match(parent_name):
+                # 检查路径中是否包含 "Aurum" 以确认是有效就诊记录
+                if 'Aurum' in root:
+                    patient_name = parent_name.strip()
+                    if patient_name:
+                        date_str = dir_name
+                        index[patient_name].append((date_str, root))
+                        if debug:
+                            print(f"[索引] {patient_name} - {date_str} -> {root}")
+
+    # 对每位患者的日期排序
     for patient in index:
-        index[patient].sort(key=lambda x: x[0])
+        index[patient].sort(key=lambda x: x[0])  # 按日期字符串排序
+
+    if debug:
+        print(f"文件系统扫描完成，共索引到 {len(index)} 位患者。")
     return index
 
+# ================== 3. 复制相邻日期文件夹 ==================
 def copy_adjacent_records(records, source_index, target_root):
     """
-    按患者分组，每个患者基于第一次出现的日期（基准），
-    在所有就诊日期中找出离基准日期最近的前一次和后一次（时间轴上相邻），复制这两个文件夹（若存在）。
-    不再要求基准日期必须存在。
+    按患者分组，取 Excel 中该患者的最早和最晚日期，
+    复制最早之前一次和最晚之后一次。
+    返回: copied_count, skipped_count (文件夹级别)
     """
-    # 分组
+    # 按患者分组 Excel 日期
     patient_groups = defaultdict(list)
     for name, date in records:
         patient_groups[name].append(date)
 
     total_patients = len(patient_groups)
     stats = {
-        'matched_had_neighbor': 0,   # 找到前或后至少一个
-        'no_neighbor': 0,           # 无前无后（只有一次就诊或完全没有）
-        'no_index': 0,             # 患者不在源索引中
-        'copied_at_least_one': 0,
+        'found_early': 0,
+        'found_late': 0,
+        'copied_early': 0,
+        'copied_late': 0,
+        'no_index': 0,
+        'no_early_or_late': 0,
     }
 
     copied_count = 0
     skipped_count = 0
-    copied_targets = set()
+    copied_targets = set()  # 已复制过的目标路径，避免重复
 
-    for name, dates in patient_groups.items():
-        target_date = dates[0]  # 取第一次出现的日期作为基准
-
+    for name, excel_dates in patient_groups.items():
         if name not in source_index:
-            print(f"未找到患者 '{name}' 的索引，跳过")
+            print(f"⚠️ 未找到患者 '{name}' 的索引，跳过")
             stats['no_index'] += 1
             continue
 
         all_dates = source_index[name]  # list of (date_str, full_path)
-        # 所有日期字符串（已排序）
         date_strs = [d[0] for d in all_dates]
 
-        # 使用二分查找基准日期的插入位置
-        idx = bisect.bisect_left(date_strs, target_date)
-        neighbors = []
-        # 前一次：插入位置-1（如果存在）
-        if idx > 0:
-            neighbors.append(all_dates[idx - 1])
-        # 后一次：插入位置（如果存在且不等于基准日期本身，但若基准日期在列表中，则该位置就是基准日期本身，需取下一个）
-        # 但我们要找的是大于基准日期的最小值，所以如果插入位置等于基准日期，则需后移一位
-        if idx < len(date_strs) and date_strs[idx] == target_date:
-            # 基准日期在列表中，取下一个
-            if idx + 1 < len(date_strs):
-                neighbors.append(all_dates[idx + 1])
-        elif idx < len(date_strs):
-            # 基准日期不在列表中，插入位置就是第一个大于基准日期的
-            neighbors.append(all_dates[idx])
+        min_excel = min(excel_dates)
+        max_excel = max(excel_dates)
 
-        # 如果基准日期本身在列表中，但 idx 指向它，我们之前已经排除了它本身，所以不会重复
-        # 现在去重（可能前一次和后一次是同一个？不可能，除非只有一个日期，但那样不会有两个邻居）
-        # 但若基准日期在列表最前面，idx=0，只有后一次；若在最后，只有前一次。
+        neighbors = []
+
+        # ---- 寻找最早日期之前的一次 ----
+        idx_min = bisect.bisect_left(date_strs, min_excel)
+        if idx_min > 0:
+            neighbors.append(all_dates[idx_min - 1])
+            stats['found_early'] += 1
+
+        # ---- 寻找最晚日期之后的一次 ----
+        idx_max = bisect.bisect_left(date_strs, max_excel)
+        if idx_max < len(date_strs):
+            if date_strs[idx_max] == max_excel:
+                if idx_max + 1 < len(date_strs):
+                    neighbors.append(all_dates[idx_max + 1])
+                    stats['found_late'] += 1
+            else:
+                neighbors.append(all_dates[idx_max])
+                stats['found_late'] += 1
 
         if not neighbors:
-            print(f"患者 '{name}' 无相邻日期，跳过")
-            stats['no_neighbor'] += 1
+            print(f"ℹ️ 患者 '{name}' 最早之前和最晚之后均不存在，跳过")
+            stats['no_early_or_late'] += 1
             continue
 
-        stats['matched_had_neighbor'] += 1
-        print(f"处理患者 '{name}'，基准日期 {target_date}，复制相邻日期: {[d[0] for d in neighbors]}")
+        neighbor_dates = [d[0] for d in neighbors]
+        print(f"处理患者 '{name}'，最早Excel日期 {min_excel}，最晚Excel日期 {max_excel}，将复制: {neighbor_dates}")
 
-        patient_copied = False
         for date_str, full_path in neighbors:
             dest_patient_dir = os.path.join(target_root, name)
             dest_dir = os.path.join(dest_patient_dir, date_str)
@@ -148,46 +170,54 @@ def copy_adjacent_records(records, source_index, target_root):
             os.makedirs(dest_patient_dir, exist_ok=True)
             try:
                 shutil.copytree(full_path, dest_dir, ignore_dangling_symlinks=True)
-                print(f"  已复制: {full_path} -> {dest_dir}")
+                print(f"  ✅ 已复制: {full_path} -> {dest_dir}")
                 copied_count += 1
                 copied_targets.add(dest_dir)
-                patient_copied = True
+                # 统计类型
+                if date_str == neighbors[0][0] and stats['found_early']:
+                    stats['copied_early'] += 1
+                elif stats['found_late']:
+                    stats['copied_late'] += 1
             except Exception as e:
-                print(f"  复制失败 {full_path} : {e}")
+                print(f"  ❌ 复制失败 {full_path} : {e}")
 
-        if patient_copied:
-            stats['copied_at_least_one'] += 1
-
-    # 打印统计报告
-    print("\n" + "="*50)
-    print("处理统计报告")
+    # 输出统计报告
+    print("\n" + "=" * 60)
+    print("统计报告")
     print(f"总患者数（Excel去重后）   : {total_patients}")
-    print(f"找到相邻日期的患者数      : {stats['matched_had_neighbor']}")
-    print(f"  └─ 至少复制了1个文件夹  : {stats['copied_at_least_one']}")
-    print(f"无相邻日期的患者数        : {stats['no_neighbor']}")
+    print(f"找到最早之前一次的患者数  : {stats['found_early']}")
+    print(f"找到最晚之后一次的患者数  : {stats['found_late']}")
+    print(f"成功复制最早之前的文件夹数: {stats['copied_early']}")
+    print(f"成功复制最晚之后的文件夹数: {stats['copied_late']}")
     print(f"未找到索引的患者数        : {stats['no_index']}")
+    print(f"无任何相邻日期的患者数    : {stats['no_early_or_late']}")
     print(f"成功复制的文件夹总数      : {copied_count}")
     print(f"因目标已存在而跳过的文件夹: {skipped_count}")
-    print("="*50)
+    print("=" * 60)
 
     return copied_count, skipped_count
 
+# ================== 4. 主程序 ==================
 def main():
-    source_root = r"补充地址"
-    excel_path = r"补充地址"
-    target_root = r"补充地址"
+    # 检查路径
+    if not os.path.exists(EXCEL_PATH):
+        print(f"❌ Excel文件不存在: {EXCEL_PATH}")
+        return
+    if not os.path.exists(SOURCE_ROOT):
+        print(f"❌ 源目录不存在: {SOURCE_ROOT}")
+        return
 
-    print("正在读取Excel...")
-    records = read_excel_dates(excel_path)
+    print("正在读取 Excel...")
+    records = read_excel_dates(EXCEL_PATH)
     print(f"共读取 {len(records)} 条记录。")
 
-    print("正在构建源索引（可能需要一些时间）...")
-    source_index = build_source_index(source_root)
-    print(f"索引构建完成，共 {len(source_index)} 位患者。")
+    print("正在扫描文件系统构建就诊索引...")
+    source_index = build_index_from_filesystem(SOURCE_ROOT, debug=DEBUG)
+    print(f"索引构建完成，共 {len(source_index)} 位患者有就诊记录。")
 
     print("开始复制相邻日期文件夹...")
-    copied, skipped = copy_adjacent_records(records, source_index, target_root)
-    print(f"处理完成。成功复制 {copied} 个文件夹，跳过 {skipped} 个（已存在或错误）。")
+    copy_adjacent_records(records, source_index, TARGET_ROOT)
+    print("处理完成。")
 
 if __name__ == "__main__":
     main()
